@@ -22,8 +22,15 @@ const PORT = process.env.PORT || 8080;
 // ============================================================
 
 const BEDS24_API_URL = 'https://api.beds24.com/v2';
-const BEDS24_TOKEN = process.env.BEDS24_TOKEN || process.env.BEDS24_REFRESH_TOKEN;
+const BEDS24_REFRESH_TOKEN = process.env.BEDS24_REFRESH_TOKEN;
+const BEDS24_PROXY_FALLBACK = 'https://beds24-proxy-1006186358018.us-central1.run.app';
 const PROPERTY_ID = 279646;
+
+// Token cache for refresh token flow
+let tokenCache = { token: null, expiresAt: 0 };
+
+// Track if direct API is working
+let useDirectApi = !!BEDS24_REFRESH_TOKEN;
 
 // Email Configuration
 const emailUser = process.env.EMAIL_USER || 'me.shovon@gmail.com';
@@ -69,10 +76,69 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ============================================================
-// BEDS24 API HELPER - With Rate Limit Awareness
+// BEDS24 TOKEN MANAGEMENT - Refresh Token Flow
+// ============================================================
+
+async function getToken() {
+    if (!BEDS24_REFRESH_TOKEN) {
+        return null; // Will trigger fallback to proxy
+    }
+
+    const now = Date.now();
+
+    // Return cached token if still valid (with 5 min buffer)
+    if (tokenCache.token && tokenCache.expiresAt > now + 300000) {
+        return tokenCache.token;
+    }
+
+    console.log('🔑 Refreshing Beds24 token...');
+
+    const res = await fetch(`${BEDS24_API_URL}/authentication/token`, {
+        headers: { 'refreshToken': BEDS24_REFRESH_TOKEN }
+    });
+
+    const data = await res.json();
+
+    if (!data.token) {
+        console.error('❌ Token refresh failed:', data);
+        useDirectApi = false;
+        return null;
+    }
+
+    // Token expires in 1 hour, cache it
+    tokenCache = {
+        token: data.token,
+        expiresAt: now + 3600000
+    };
+
+    console.log('✅ Token refreshed successfully');
+    useDirectApi = true;
+    return data.token;
+}
+
+// ============================================================
+// BEDS24 API HELPER - With Proxy Fallback
 // ============================================================
 
 async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
+    // Try direct API first if configured
+    if (useDirectApi) {
+        try {
+            const token = await getToken();
+            if (token) {
+                return await fetchBeds24Direct(endpoint, params, method, body, token);
+            }
+        } catch (error) {
+            console.error('Direct API failed, falling back to proxy:', error.message);
+            useDirectApi = false;
+        }
+    }
+
+    // Fallback to existing proxy
+    return await fetchBeds24ViaProxy(endpoint, params, method, body);
+}
+
+async function fetchBeds24Direct(endpoint, params, method, body, token) {
     const url = new URL(`${BEDS24_API_URL}/${endpoint}`);
 
     // Add query params for GET requests
@@ -84,12 +150,12 @@ async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
         });
     }
 
-    console.log(`📡 Beds24 ${method}: ${url.toString()}`);
+    console.log(`📡 Beds24 Direct ${method}: ${url.toString()}`);
 
     const options = {
         method,
         headers: {
-            'token': BEDS24_TOKEN,
+            'token': token,
             'Content-Type': 'application/json'
         }
     };
@@ -117,12 +183,54 @@ async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
 
     const data = await response.json();
 
-    // Handle API errors
     if (data.success === false || data.error) {
         throw new Error(data.error || 'API request failed');
     }
 
     return { data, status: response.status, headers: response.headers };
+}
+
+async function fetchBeds24ViaProxy(endpoint, params, method, body) {
+    // Map endpoint to proxy URLs
+    let proxyUrl;
+
+    if (endpoint === 'bookings') {
+        proxyUrl = `${BEDS24_PROXY_FALLBACK}/getBookings`;
+    } else if (endpoint.includes('rooms')) {
+        proxyUrl = `${BEDS24_PROXY_FALLBACK}/getRooms`;
+    } else {
+        // Generic proxy endpoint
+        proxyUrl = `${BEDS24_PROXY_FALLBACK}/?endpoint=${endpoint}`;
+    }
+
+    const url = new URL(proxyUrl);
+
+    // Add query params
+    Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== '' && key !== 'propertyId') {
+            url.searchParams.append(key, value);
+        }
+    });
+
+    console.log(`📡 Beds24 Proxy ${method}: ${url.toString()}`);
+
+    const options = { method };
+    if (body && method !== 'GET') {
+        options.headers = { 'Content-Type': 'application/json' };
+        options.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(url.toString(), options);
+    const data = await response.json();
+
+    // Normalize response format
+    if (data.data) {
+        return { data, status: response.status };
+    } else if (Array.isArray(data)) {
+        return { data: { data }, status: response.status };
+    }
+
+    return { data: { data: data }, status: response.status };
 }
 
 // ============================================================
@@ -133,6 +241,8 @@ app.get('/', (req, res) => {
     res.json({
         status: 'Miami Beach Resort API v4.0',
         strategy: 'API primary + Webhook backup + Firestore cache',
+        mode: useDirectApi ? 'direct-api' : 'proxy-fallback',
+        refreshTokenSet: !!BEDS24_REFRESH_TOKEN,
         propertyId: PROPERTY_ID,
         timestamp: new Date().toISOString(),
         rateLimit: rateLimitInfo,
