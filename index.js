@@ -174,7 +174,10 @@ async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
     // Try direct API first if configured
     if (useDirectApi) {
         try {
-            const token = await getToken();
+            // Use WRITE token for POST/PUT/DELETE, READ token for GET
+            const token = (method === 'POST' || method === 'PUT' || method === 'DELETE')
+                ? await getWriteToken()
+                : await getReadToken();
             if (token) {
                 return await fetchBeds24Direct(endpoint, params, method, body, token);
             }
@@ -244,7 +247,10 @@ async function fetchBeds24ViaProxy(endpoint, params, method, body) {
     // Map endpoint to proxy URLs
     let proxyUrl;
 
-    if (endpoint === 'bookings') {
+    // For POST requests, always use the generic proxy endpoint
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+        proxyUrl = `${BEDS24_PROXY_FALLBACK}/?endpoint=${endpoint}`;
+    } else if (endpoint === 'bookings') {
         proxyUrl = `${BEDS24_PROXY_FALLBACK}/getBookings`;
     } else if (endpoint.includes('rooms')) {
         proxyUrl = `${BEDS24_PROXY_FALLBACK}/getRooms`;
