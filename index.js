@@ -1,14 +1,12 @@
 /**
- * Miami Beach Resort - Unified Backend API v3.0
- * Fixed: Proper parameter passing to Beds24 API V2
+ * Miami Beach Resort - Unified Backend API v4.0
  *
- * Endpoints:
- * - GET /                     - Health check
- * - GET /getBookings          - Proxy to Beds24 API (ALL params supported)
- * - GET /getRooms             - Get rooms and units
- * - POST /webhook/booking     - Receives Beds24 webhooks
- * - GET /notifications        - Get recent booking notifications
- * - HK endpoints              - All housekeeping functionality
+ * MIXED STRATEGY:
+ * - API: Primary data source for bookings, rooms, creating/updating
+ * - Webhook: Backup for real-time updates, syncs to Firestore cache
+ * - Firestore: Persistent cache, serves as fallback when API fails
+ *
+ * Based on Beds24 API V2 spec: https://beds24.com/api/v2/apiV2.yaml
  */
 
 const express = require('express');
@@ -19,6 +17,18 @@ const nodemailer = require('nodemailer');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const BEDS24_API_URL = 'https://api.beds24.com/v2';
+const BEDS24_TOKEN = process.env.BEDS24_TOKEN || process.env.BEDS24_REFRESH_TOKEN;
+const PROPERTY_ID = 279646;
+
+// Email Configuration
+const emailUser = process.env.EMAIL_USER || 'me.shovon@gmail.com';
+const emailPass = process.env.EMAIL_PASS || 'cayqfuwnmenowljd';
+
 // Initialize Firestore
 const db = new Firestore({
     projectId: 'beds24-483408',
@@ -26,208 +36,360 @@ const db = new Firestore({
 });
 
 // Collections
+const bookingCacheCollection = db.collection('booking_cache');
 const notificationsCollection = db.collection('booking_notifications');
 const hkDataCollection = db.collection('housekeeping_data');
 const hkUsersCollection = db.collection('hk_users');
 const otpCollection = db.collection('otp_codes');
-const bookingCacheCollection = db.collection('booking_cache');
 const dashboardDataCollection = db.collection('dashboard_data');
+const roomsCacheCollection = db.collection('rooms_cache');
 
-// Beds24 API Configuration
-const BEDS24_API_URL = 'https://api.beds24.com/v2';
-const BEDS24_TOKEN = process.env.BEDS24_TOKEN || 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJBdXRoZW50aWNhdGlvblNlcnZlciIsInN1YiI6IjE2MjA5OSIsImF1ZCI6IkJlZHMyNEFQSVYyIiwiaWF0IjoxNzM0NDQxOTQwLCJuYmYiOjE3MzQ0NDE5NDAsImV4cCI6MTg5MjIwODM0MCwidG9rZW5JZCI6NzkyMzcsInJlZnJlc2giOmZhbHNlLCJhcGlBY2Nlc3MiOnRydWUsImludml0ZSI6ZmFsc2UsImNsaWVudCI6InRva2VuIiwic2NvcGVzIjpbImJvb2tpbmdzIiwiaW52b2ljZXMiXX0.H6HfJMgPaLlW9hREAy1x1JjAqh-MlPbr_gNRwwdh2uyK1nY-m2f-8Npc9Ygxf-H9Gqv_WMsJNkPjWGmLVrP9rH3n-M5GnQOxrfYgqCJlJxMzLMPjhLk3N5Yk7QQZ2Cxw';
-const PROPERTY_ID = 279646;
+// In-memory cache for faster responses
+let memoryCache = {
+    bookings: { data: null, timestamp: 0, ttl: 60000 }, // 1 min TTL
+    rooms: { data: null, timestamp: 0, ttl: 3600000 }   // 1 hour TTL
+};
 
-// Email Configuration
-const emailUser = process.env.EMAIL_USER || 'me.shovon@gmail.com';
-const emailPass = process.env.EMAIL_PASS || 'cayqfuwnmenowljd';
+// Rate limit tracking
+let rateLimitInfo = {
+    remaining: 1000,
+    resetsIn: 0,
+    lastUpdated: 0
+};
 
+// Email transporter
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: { user: emailUser, pass: emailPass }
 });
 
-// CORS Configuration
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
+// CORS & Middleware
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ============================================================
-// HELPER: Fetch from Beds24 API with proper headers
+// BEDS24 API HELPER - With Rate Limit Awareness
 // ============================================================
-async function fetchBeds24(endpoint, params = {}) {
+
+async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
     const url = new URL(`${BEDS24_API_URL}/${endpoint}`);
 
-    // Add all params to URL
-    Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null && value !== '') {
-            url.searchParams.append(key, value);
-        }
-    });
+    // Add query params for GET requests
+    if (method === 'GET') {
+        Object.entries(params).forEach(([key, value]) => {
+            if (value !== undefined && value !== null && value !== '') {
+                url.searchParams.append(key, value);
+            }
+        });
+    }
 
-    console.log(`📡 Beds24 API: ${url.toString()}`);
+    console.log(`📡 Beds24 ${method}: ${url.toString()}`);
 
-    const response = await fetch(url.toString(), {
-        method: 'GET',
+    const options = {
+        method,
         headers: {
             'token': BEDS24_TOKEN,
             'Content-Type': 'application/json'
         }
-    });
+    };
 
-    return response.json();
+    if (body && method !== 'GET') {
+        options.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(url.toString(), options);
+
+    // Track rate limits from response headers
+    const remaining = response.headers.get('X-FiveMinCreditLimit-Remaining');
+    const resetsIn = response.headers.get('X-FiveMinCreditLimit-ResetsIn');
+    const requestCost = response.headers.get('X-RequestCost');
+
+    if (remaining) {
+        rateLimitInfo = {
+            remaining: parseInt(remaining),
+            resetsIn: parseInt(resetsIn || 0),
+            requestCost: parseInt(requestCost || 1),
+            lastUpdated: Date.now()
+        };
+        console.log(`⚡ Rate limit: ${remaining} credits remaining`);
+    }
+
+    const data = await response.json();
+
+    // Handle API errors
+    if (data.success === false || data.error) {
+        throw new Error(data.error || 'API request failed');
+    }
+
+    return { data, status: response.status, headers: response.headers };
 }
 
 // ============================================================
-// HEALTH CHECK
+// HEALTH CHECK & STATUS
 // ============================================================
+
 app.get('/', (req, res) => {
     res.json({
-        status: 'Miami Beach Resort API v3.0',
-        services: ['beds24-proxy', 'housekeeping', 'webhooks', 'notifications'],
+        status: 'Miami Beach Resort API v4.0',
+        strategy: 'API primary + Webhook backup + Firestore cache',
         propertyId: PROPERTY_ID,
         timestamp: new Date().toISOString(),
+        rateLimit: rateLimitInfo,
+        cache: {
+            bookings: memoryCache.bookings.data ? `${memoryCache.bookings.data.length} items` : 'empty',
+            rooms: memoryCache.rooms.data ? `${memoryCache.rooms.data.length} rooms` : 'empty'
+        },
         endpoints: {
-            bookings: '/getBookings?filter=current|arrivals|departures',
-            rooms: '/getRooms',
-            webhook: 'POST /webhook/booking',
-            notifications: '/notifications'
+            // Booking endpoints
+            getBookings: 'GET /getBookings - All bookings with filters',
+            createBooking: 'POST /bookings - Create/update bookings',
+
+            // Room endpoints
+            getRooms: 'GET /getRooms - All rooms and units',
+
+            // Dashboard optimized
+            dashboard: 'GET /dashboard/data - Optimized dashboard data',
+
+            // Webhook
+            webhook: 'POST /webhook/booking - Beds24 webhook receiver',
+
+            // Cache management
+            refreshCache: 'POST /cache/refresh - Force refresh all caches'
         }
     });
 });
 
 // ============================================================
-// BEDS24 PROXY - FIXED: Passes ALL query parameters
+// BOOKINGS API - Full parameter support per API V2 spec
 // ============================================================
 
-// Supported Beds24 booking parameters (from API V2 spec)
+// All supported booking query parameters from API V2 spec
 const BOOKING_PARAMS = [
-    'filter',           // arrivals, departures, new, current
-    'propertyId',
-    'roomId',
-    'id',
-    'masterId',
-    'apiReference',
-    'channel',
-    'arrival',
-    'arrivalFrom',
-    'arrivalTo',
-    'departure',
-    'departureFrom',
-    'departureTo',
-    'bookingTimeFrom',
-    'bookingTimeTo',
-    'modifiedFrom',
-    'modifiedTo',
-    'searchString',
-    'includeInvoiceItems',
-    'includeInfoItems',
-    'includeGuests',
-    'includeBookingGroup',
-    'status',
+    // Filters
+    'filter',           // arrivals | departures | new | current
+    'status',           // confirmed | request | new | cancelled | black | inquiry
+    'channel',          // airbnb, booking.com, etc
+
+    // IDs (support multiple values)
+    'propertyId', 'roomId', 'id', 'masterId', 'apiReference',
+
+    // Date filters
+    'arrival', 'arrivalFrom', 'arrivalTo',
+    'departure', 'departureFrom', 'departureTo',
+    'bookingTimeFrom', 'bookingTimeTo',
+    'modifiedFrom', 'modifiedTo',
+
+    // Search
+    'searchString',     // matches guest name, email, apiref, bookingId
+
+    // Include additional data
+    'includeInvoiceItems', 'includeInfoItems', 'includeGuests', 'includeBookingGroup',
+
+    // Pagination
     'page'
 ];
 
+// GET /getBookings - Primary booking endpoint
 app.get('/getBookings', async (req, res) => {
     try {
-        // Build params object from query - pass through ALL supported params
-        const params = { propertyId: PROPERTY_ID };
+        const startTime = Date.now();
 
+        // Build params from query
+        const params = { propertyId: PROPERTY_ID };
         BOOKING_PARAMS.forEach(param => {
             if (req.query[param] !== undefined) {
                 params[param] = req.query[param];
             }
         });
 
-        const data = await fetchBeds24('bookings', params);
+        // Try API first
+        let bookings = [];
+        let source = 'api';
+        let pages = null;
 
-        // Standardize response format
-        if (data.success === false) {
-            return res.status(400).json(data);
+        try {
+            const result = await fetchBeds24('bookings', params);
+            bookings = result.data.data || result.data || [];
+            pages = result.data.pages || null;
+
+            // Update memory cache if this is a full fetch (no specific filters)
+            if (!req.query.filter && !req.query.id && !req.query.searchString) {
+                memoryCache.bookings = { data: bookings, timestamp: Date.now(), ttl: 60000 };
+
+                // Also update Firestore cache asynchronously
+                updateFirestoreBookingCache(bookings).catch(err => console.error('Cache update error:', err));
+            }
+        } catch (apiError) {
+            console.error('API error, trying cache:', apiError.message);
+            source = 'cache';
+
+            // Fallback to memory cache
+            if (memoryCache.bookings.data) {
+                bookings = memoryCache.bookings.data;
+                console.log('📦 Using memory cache');
+            } else {
+                // Fallback to Firestore cache
+                const cached = await getFirestoreBookingCache();
+                if (cached) {
+                    bookings = cached;
+                    console.log('📦 Using Firestore cache');
+                }
+            }
         }
+
+        const loadTime = Date.now() - startTime;
 
         res.json({
             success: true,
-            type: 'booking',
-            count: data.data?.length || 0,
-            pages: data.pages || null,
-            data: data.data || []
+            source,
+            count: bookings.length,
+            pages,
+            loadTime,
+            data: bookings
         });
 
     } catch (error) {
-        console.error('Proxy error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('GetBookings error:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Get rooms and units
+// POST /bookings - Create or update bookings (batch support)
+app.post('/bookings', async (req, res) => {
+    try {
+        const bookingData = req.body;
+
+        // Ensure it's an array for batch processing
+        const bookings = Array.isArray(bookingData) ? bookingData : [bookingData];
+
+        // Add propertyId if not specified
+        bookings.forEach(b => {
+            if (!b.propertyId) b.propertyId = PROPERTY_ID;
+        });
+
+        console.log(`📝 Creating/updating ${bookings.length} booking(s)`);
+
+        const result = await fetchBeds24('bookings', {}, 'POST', bookings);
+
+        // Invalidate cache after modification
+        memoryCache.bookings.timestamp = 0;
+
+        res.json({
+            success: true,
+            data: result.data
+        });
+
+    } catch (error) {
+        console.error('Create booking error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
+// ROOMS API - Using /properties endpoint with room details
+// ============================================================
+
 app.get('/getRooms', async (req, res) => {
     try {
-        const data = await fetchBeds24(`properties/${PROPERTY_ID}/rooms`);
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
+        const startTime = Date.now();
+        let rooms = [];
+        let source = 'api';
 
-// Generic proxy for any Beds24 endpoint
-app.get('/beds24/:endpoint(*)', async (req, res) => {
-    try {
-        const data = await fetchBeds24(req.params.endpoint, req.query);
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
+        // Check memory cache first
+        const now = Date.now();
+        if (memoryCache.rooms.data && (now - memoryCache.rooms.timestamp) < memoryCache.rooms.ttl) {
+            console.log('📦 Using cached rooms');
+            return res.json({
+                success: true,
+                source: 'cache',
+                count: memoryCache.rooms.data.length,
+                data: memoryCache.rooms.data
+            });
+        }
 
-// POST to Beds24 (for creating/updating bookings)
-app.post('/beds24/:endpoint(*)', async (req, res) => {
-    try {
-        const url = `${BEDS24_API_URL}/${req.params.endpoint}`;
+        try {
+            // Fetch properties with all room details
+            const result = await fetchBeds24('properties', {
+                id: PROPERTY_ID,
+                includeAllRooms: true,
+                includeUnitDetails: true
+            });
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'token': BEDS24_TOKEN,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(req.body)
+            // Extract rooms from property data
+            const propertyData = result.data.data || result.data || [];
+            const property = Array.isArray(propertyData) ? propertyData[0] : propertyData;
+
+            if (property && property.roomTypes) {
+                rooms = property.roomTypes.map(room => ({
+                    id: room.id,
+                    name: room.name,
+                    maxPeople: room.maxPeople,
+                    qty: room.qty,
+                    units: room.units || [],
+                    priceRules: room.priceRules || []
+                }));
+            }
+
+            // Update cache
+            memoryCache.rooms = { data: rooms, timestamp: now, ttl: 3600000 };
+
+            // Store in Firestore for persistence
+            await roomsCacheCollection.doc('current').set({
+                data: rooms,
+                updatedAt: Firestore.FieldValue.serverTimestamp()
+            });
+
+        } catch (apiError) {
+            console.error('Rooms API error, trying cache:', apiError.message);
+            source = 'cache';
+
+            // Try Firestore cache
+            const cached = await roomsCacheCollection.doc('current').get();
+            if (cached.exists) {
+                rooms = cached.data().data;
+            }
+        }
+
+        const loadTime = Date.now() - startTime;
+
+        res.json({
+            success: true,
+            source,
+            count: rooms.length,
+            loadTime,
+            data: rooms
         });
 
-        const data = await response.json();
-        res.status(response.status).json(data);
     } catch (error) {
+        console.error('GetRooms error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // ============================================================
-// OPTIMIZED: Get all bookings for dashboard (parallel fetch)
+// DASHBOARD OPTIMIZED ENDPOINT - Mixed Strategy
 // ============================================================
-app.get('/dashboard/bookings', async (req, res) => {
+
+app.get('/dashboard/data', async (req, res) => {
     try {
         const startTime = Date.now();
+        const today = new Date().toISOString().slice(0, 10);
 
-        // Parallel fetch: current occupancy + future bookings
-        const [currentData, futureData] = await Promise.all([
+        // Parallel fetch multiple data sets
+        const [currentResult, arrivalsResult, departuresResult] = await Promise.allSettled([
             fetchBeds24('bookings', { propertyId: PROPERTY_ID, filter: 'current' }),
-            fetchBeds24('bookings', {
-                propertyId: PROPERTY_ID,
-                arrivalFrom: new Date().toISOString().slice(0, 10),
-                arrivalTo: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-            })
+            fetchBeds24('bookings', { propertyId: PROPERTY_ID, filter: 'arrivals' }),
+            fetchBeds24('bookings', { propertyId: PROPERTY_ID, filter: 'departures' })
         ]);
 
+        // Extract data with fallbacks
+        const current = currentResult.status === 'fulfilled' ? (currentResult.value.data.data || []) : [];
+        const arrivals = arrivalsResult.status === 'fulfilled' ? (arrivalsResult.value.data.data || []) : [];
+        const departures = departuresResult.status === 'fulfilled' ? (departuresResult.value.data.data || []) : [];
+
         // Combine and deduplicate
-        const allBookings = [...(currentData.data || []), ...(futureData.data || [])];
+        const allBookings = [...current, ...arrivals, ...departures];
         const seen = new Set();
         const uniqueBookings = allBookings.filter(b => {
             if (seen.has(b.id)) return false;
@@ -235,99 +397,245 @@ app.get('/dashboard/bookings', async (req, res) => {
             return true;
         });
 
-        // Filter out cancelled
-        const activeBookings = uniqueBookings.filter(b => b.status !== 'cancelled');
+        // Calculate stats
+        const stats = {
+            occupied: current.filter(b => b.status !== 'cancelled').length,
+            checkInsToday: arrivals.filter(b => b.arrival === today && b.status !== 'cancelled').length,
+            checkOutsToday: departures.filter(b => b.departure === today).length,
+            totalActive: uniqueBookings.filter(b => b.status !== 'cancelled').length
+        };
+
+        // Update cache with combined data
+        memoryCache.bookings = {
+            data: uniqueBookings.filter(b => b.status !== 'cancelled'),
+            timestamp: Date.now(),
+            ttl: 60000
+        };
 
         const loadTime = Date.now() - startTime;
-        console.log(`✅ Dashboard bookings: ${activeBookings.length} in ${loadTime}ms`);
 
         res.json({
             success: true,
-            count: activeBookings.length,
             loadTime,
-            data: activeBookings
+            stats,
+            data: uniqueBookings.filter(b => b.status !== 'cancelled')
+        });
+
+    } catch (error) {
+        console.error('Dashboard data error:', error);
+
+        // Fallback to cache
+        if (memoryCache.bookings.data) {
+            res.json({
+                success: true,
+                source: 'cache',
+                data: memoryCache.bookings.data
+            });
+        } else {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    }
+});
+
+// ============================================================
+// WEBHOOK ENDPOINT - Backup data source, syncs to Firestore
+// ============================================================
+
+app.post('/webhook/booking', async (req, res) => {
+    try {
+        const startTime = Date.now();
+        console.log('=== WEBHOOK RECEIVED ===');
+
+        const webhookData = req.body;
+
+        // Parse booking data - Beds24 webhook format
+        let booking = null;
+        let action = 'unknown';
+
+        // Handle different webhook formats
+        if (webhookData.booking) {
+            // Format: { booking: {...}, invoiceItems: [...], ... }
+            booking = webhookData.booking;
+            action = booking.cancelTime ? 'cancelled' :
+                     (booking.bookingTime === booking.modifiedTime ? 'new_booking' : 'modified');
+        } else if (webhookData.id && webhookData.roomId) {
+            // Direct booking object
+            booking = webhookData;
+            action = webhookData.cancelTime ? 'cancelled' :
+                     webhookData.action || 'modified';
+        } else if (webhookData.action) {
+            // Action-based webhook (SYNC_ROOM, etc)
+            action = webhookData.action;
+        }
+
+        // Create notification record
+        const notification = {
+            type: 'booking_update',
+            action,
+            bookingId: booking?.id || webhookData.bookingId || null,
+            propertyId: booking?.propertyId || webhookData.propId || PROPERTY_ID,
+            guestName: booking ? `${booking.firstName || ''} ${booking.lastName || ''}`.trim() || 'Unknown' : 'Unknown',
+            roomId: booking?.roomId || webhookData.roomId || null,
+            unitId: booking?.unitId || null,
+            arrival: booking?.arrival || null,
+            departure: booking?.departure || null,
+            status: booking?.status || null,
+            price: booking?.price || null,
+            deposit: booking?.deposit || null,
+            receivedAt: Firestore.FieldValue.serverTimestamp(),
+            processedAt: null,
+            rawData: webhookData
+        };
+
+        // Store notification
+        const docRef = await notificationsCollection.add(notification);
+        console.log(`✅ Webhook stored: ${docRef.id} (${action})`);
+
+        // If this is a booking update, update our cache
+        if (booking && booking.id) {
+            await updateSingleBookingInCache(booking);
+        }
+
+        // Invalidate memory cache to force fresh fetch
+        memoryCache.bookings.timestamp = 0;
+
+        // Respond immediately (Beds24 expects quick response)
+        res.status(200).json({
+            success: true,
+            notificationId: docRef.id,
+            action,
+            processTime: Date.now() - startTime
+        });
+
+        // Cleanup old notifications (async, don't wait)
+        cleanupOldNotifications().catch(err => console.error('Cleanup error:', err));
+
+    } catch (error) {
+        console.error('Webhook error:', error);
+        // Still return 200 to prevent Beds24 retries
+        res.status(200).json({ success: false, error: error.message });
+    }
+});
+
+// Update single booking in Firestore cache
+async function updateSingleBookingInCache(booking) {
+    try {
+        const cacheDoc = await bookingCacheCollection.doc('current').get();
+        if (cacheDoc.exists) {
+            let bookings = cacheDoc.data().data || [];
+
+            // Find and update or add
+            const idx = bookings.findIndex(b => b.id === booking.id);
+            if (idx >= 0) {
+                if (booking.status === 'cancelled') {
+                    bookings.splice(idx, 1); // Remove cancelled
+                } else {
+                    bookings[idx] = booking; // Update
+                }
+            } else if (booking.status !== 'cancelled') {
+                bookings.push(booking); // Add new
+            }
+
+            await bookingCacheCollection.doc('current').set({
+                data: bookings,
+                updatedAt: Firestore.FieldValue.serverTimestamp(),
+                lastWebhook: booking.id
+            });
+
+            console.log(`📦 Cache updated via webhook: booking ${booking.id}`);
+        }
+    } catch (error) {
+        console.error('Cache update error:', error);
+    }
+}
+
+// ============================================================
+// FIRESTORE CACHE HELPERS
+// ============================================================
+
+async function updateFirestoreBookingCache(bookings) {
+    try {
+        await bookingCacheCollection.doc('current').set({
+            data: bookings,
+            count: bookings.length,
+            updatedAt: Firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`📦 Firestore cache updated: ${bookings.length} bookings`);
+    } catch (error) {
+        console.error('Firestore cache update error:', error);
+    }
+}
+
+async function getFirestoreBookingCache() {
+    try {
+        const doc = await bookingCacheCollection.doc('current').get();
+        if (doc.exists) {
+            return doc.data().data;
+        }
+    } catch (error) {
+        console.error('Firestore cache read error:', error);
+    }
+    return null;
+}
+
+async function cleanupOldNotifications() {
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days
+    const oldDocs = await notificationsCollection
+        .where('receivedAt', '<', cutoff)
+        .limit(100)
+        .get();
+
+    if (oldDocs.size > 0) {
+        const batch = db.batch();
+        oldDocs.docs.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+        console.log(`🧹 Cleaned ${oldDocs.size} old notifications`);
+    }
+}
+
+// ============================================================
+// CACHE MANAGEMENT
+// ============================================================
+
+app.post('/cache/refresh', async (req, res) => {
+    try {
+        console.log('🔄 Force refreshing all caches...');
+
+        // Clear memory cache
+        memoryCache.bookings.timestamp = 0;
+        memoryCache.rooms.timestamp = 0;
+
+        // Fetch fresh data
+        const [bookingsResult, roomsResult] = await Promise.allSettled([
+            fetchBeds24('bookings', { propertyId: PROPERTY_ID }),
+            fetchBeds24('properties', { id: PROPERTY_ID, includeAllRooms: true })
+        ]);
+
+        let bookingsCount = 0, roomsCount = 0;
+
+        if (bookingsResult.status === 'fulfilled') {
+            const bookings = bookingsResult.value.data.data || [];
+            memoryCache.bookings = { data: bookings, timestamp: Date.now(), ttl: 60000 };
+            await updateFirestoreBookingCache(bookings);
+            bookingsCount = bookings.length;
+        }
+
+        if (roomsResult.status === 'fulfilled') {
+            const property = roomsResult.value.data.data?.[0] || roomsResult.value.data;
+            const rooms = property?.roomTypes || [];
+            memoryCache.rooms = { data: rooms, timestamp: Date.now(), ttl: 3600000 };
+            roomsCount = rooms.length;
+        }
+
+        res.json({
+            success: true,
+            refreshed: { bookings: bookingsCount, rooms: roomsCount }
         });
 
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
-
-// ============================================================
-// WEBHOOK ENDPOINT - Receives Beds24 booking notifications
-// ============================================================
-
-app.post('/webhook/booking', async (req, res) => {
-    try {
-        console.log('=== WEBHOOK RECEIVED ===');
-        console.log('Body:', JSON.stringify(req.body, null, 2));
-
-        const webhookData = req.body;
-
-        // Create notification document
-        const notification = {
-            type: 'booking_update',
-            bookingId: webhookData.id || webhookData.bookingId || null,
-            propertyId: webhookData.propertyId || PROPERTY_ID,
-            action: determineAction(webhookData),
-            guestName: webhookData.firstName ?
-                `${webhookData.firstName} ${webhookData.lastName || ''}`.trim() :
-                'Unknown Guest',
-            roomId: webhookData.roomId || null,
-            unitId: webhookData.unitId || null,
-            arrival: webhookData.arrival || null,
-            departure: webhookData.departure || null,
-            status: webhookData.status || null,
-            receivedAt: Firestore.FieldValue.serverTimestamp(),
-            processed: false,
-            rawData: webhookData
-        };
-
-        const docRef = await notificationsCollection.add(notification);
-        console.log(`Notification saved: ${docRef.id}`);
-
-        // Respond to Beds24 immediately
-        res.status(200).json({
-            success: true,
-            notificationId: docRef.id,
-            message: 'Webhook received'
-        });
-
-        // Auto-cleanup old notifications
-        cleanupOldNotifications();
-
-    } catch (error) {
-        console.error('Webhook error:', error);
-        res.status(200).json({ success: false, error: error.message });
-    }
-});
-
-function determineAction(data) {
-    if (data.cancelTime) return 'cancelled';
-    if (data.status === 'request') return 'new_request';
-    if (data.bookingTime && data.modifiedTime && data.bookingTime === data.modifiedTime) {
-        return 'new_booking';
-    }
-    return 'modified';
-}
-
-async function cleanupOldNotifications() {
-    try {
-        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        const oldDocs = await notificationsCollection
-            .where('receivedAt', '<', cutoff)
-            .get();
-
-        if (oldDocs.size > 0) {
-            const batch = db.batch();
-            oldDocs.docs.forEach(doc => batch.delete(doc.ref));
-            await batch.commit();
-            console.log(`Cleaned up ${oldDocs.size} old notifications`);
-        }
-    } catch (error) {
-        console.error('Cleanup error:', error);
-    }
-}
 
 // ============================================================
 // NOTIFICATIONS API
@@ -336,16 +644,20 @@ async function cleanupOldNotifications() {
 app.get('/notifications', async (req, res) => {
     try {
         const limit = parseInt(req.query.limit) || 50;
+        const since = req.query.since; // ISO date string
 
-        const snapshot = await notificationsCollection
-            .orderBy('receivedAt', 'desc')
-            .limit(limit)
-            .get();
+        let query = notificationsCollection.orderBy('receivedAt', 'desc').limit(limit);
+
+        if (since) {
+            query = query.where('receivedAt', '>', new Date(since));
+        }
+
+        const snapshot = await query.get();
 
         const notifications = snapshot.docs.map(doc => ({
             id: doc.id,
             ...doc.data(),
-            receivedAt: doc.data().receivedAt?.toDate?.() || null
+            receivedAt: doc.data().receivedAt?.toDate?.()?.toISOString() || null
         }));
 
         res.json({ success: true, count: notifications.length, notifications });
@@ -363,23 +675,32 @@ app.delete('/notifications/:id', async (req, res) => {
     }
 });
 
-app.delete('/notifications', async (req, res) => {
+// ============================================================
+// GENERIC BEDS24 PROXY - For any endpoint
+// ============================================================
+
+app.get('/beds24/:endpoint(*)', async (req, res) => {
     try {
-        const snapshot = await notificationsCollection.get();
-        const batch = db.batch();
-        snapshot.docs.forEach(doc => batch.delete(doc.ref));
-        await batch.commit();
-        res.json({ success: true, deleted: snapshot.size });
+        const result = await fetchBeds24(req.params.endpoint, req.query);
+        res.json(result.data);
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/beds24/:endpoint(*)', async (req, res) => {
+    try {
+        const result = await fetchBeds24(req.params.endpoint, {}, 'POST', req.body);
+        res.json(result.data);
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // ============================================================
-// DASHBOARD DATA PERSISTENCE (Firestore backup)
+// DASHBOARD DATA PERSISTENCE
 // ============================================================
 
-// Save dashboard state
 app.post('/dashboard/save', async (req, res) => {
     try {
         const { type, data } = req.body;
@@ -396,15 +717,13 @@ app.post('/dashboard/save', async (req, res) => {
     }
 });
 
-// Load dashboard state
 app.get('/dashboard/load/:type', async (req, res) => {
     try {
         const doc = await dashboardDataCollection.doc(req.params.type).get();
-        if (doc.exists) {
-            res.json({ success: true, data: doc.data().data });
-        } else {
-            res.json({ success: true, data: null });
-        }
+        res.json({
+            success: true,
+            data: doc.exists ? doc.data().data : null
+        });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -437,16 +756,17 @@ app.get('/load', async (req, res) => {
         if (!type) return res.status(400).json({ error: 'Missing type' });
 
         const doc = await hkDataCollection.doc(type).get();
-        if (!doc.exists) return res.json({ data: null });
-
-        res.json({ data: doc.data().data, timestamp: doc.data().timestamp });
+        res.json({
+            data: doc.exists ? doc.data().data : null,
+            timestamp: doc.exists ? doc.data().timestamp : null
+        });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // ============================================================
-// USER MANAGEMENT
+// USER MANAGEMENT & AUTH
 // ============================================================
 
 app.get('/users', async (req, res) => {
@@ -487,10 +807,7 @@ app.delete('/users/:id', async (req, res) => {
     }
 });
 
-// ============================================================
-// AUTHENTICATION (OTP)
-// ============================================================
-
+// OTP Authentication
 app.post('/auth/send-otp', async (req, res) => {
     try {
         const { email } = req.body;
@@ -568,8 +885,14 @@ app.post('/auth/verify-otp', async (req, res) => {
 // ============================================================
 
 app.listen(PORT, () => {
-    console.log(`🚀 Miami Beach Resort API v3.0 running on port ${PORT}`);
+    console.log(`🚀 Miami Beach Resort API v4.0 running on port ${PORT}`);
+    console.log(`   Strategy: API primary + Webhook backup + Firestore cache`);
     console.log(`   Property ID: ${PROPERTY_ID}`);
-    console.log(`   Endpoints: /getBookings, /getRooms, /webhook/booking, /notifications`);
-    console.log(`   Dashboard: /dashboard/bookings (optimized parallel fetch)`);
+    console.log(`   Endpoints:`);
+    console.log(`   - GET  /getBookings     - Bookings with all Beds24 filters`);
+    console.log(`   - POST /bookings        - Create/update bookings`);
+    console.log(`   - GET  /getRooms        - Rooms and units`);
+    console.log(`   - GET  /dashboard/data  - Optimized dashboard data`);
+    console.log(`   - POST /webhook/booking - Webhook receiver (backup)`);
+    console.log(`   - POST /cache/refresh   - Force cache refresh`);
 });
