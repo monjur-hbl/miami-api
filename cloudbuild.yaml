@@ -1,0 +1,22 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/miami-api', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/miami-api']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'miami-api'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/miami-api'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '512Mi'
+      - '--set-env-vars'
+      - 'BEDS24_TOKEN=${_BEDS24_TOKEN},EMAIL_USER=${_EMAIL_USER},EMAIL_PASS=${_EMAIL_PASS}'

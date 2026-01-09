@@ -1,0 +1,18 @@
+{
+  "name": "miami-api",
+  "version": "3.0.0",
+  "description": "Miami Beach Resort - Unified Backend API with proper Beds24 parameter passing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@google-cloud/firestore": "^7.1.0",
+    "nodemailer": "^6.9.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
