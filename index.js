@@ -179,15 +179,18 @@ async function fetchBeds24(endpoint, params = {}, method = 'GET', body = null) {
                 ? await getWriteToken()
                 : await getReadToken();
             if (token) {
-                return await fetchBeds24Direct(endpoint, params, method, body, token);
+                const result = await fetchBeds24Direct(endpoint, params, method, body, token);
+                return result;
+            } else {
+                console.log(`⚠️ No ${method === 'GET' ? 'READ' : 'WRITE'} token available, using proxy fallback`);
             }
         } catch (error) {
             console.error('Direct API failed, falling back to proxy:', error.message);
-            useDirectApi = false;
         }
     }
 
     // Fallback to existing proxy
+    console.log(`📡 Using proxy fallback for ${method} ${endpoint}`);
     return await fetchBeds24ViaProxy(endpoint, params, method, body);
 }
 
